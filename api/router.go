@@ -147,6 +147,8 @@ func Route(
 
 	publicAPIRouter.HandleFunc("/auth/login", login).Methods("GET", "POST")
 	publicAPIRouter.HandleFunc("/auth/verify", verifySession).Methods("POST")
+	publicAPIRouter.HandleFunc("/auth/totp/setup", getTotpSetup).Methods("GET", "HEAD")
+	publicAPIRouter.HandleFunc("/auth/totp/setup/qr", getTotpSetupQr).Methods("GET", "HEAD")
 	publicAPIRouter.HandleFunc("/auth/recovery", recoverySession).Methods("POST")
 
 	publicAPIRouter.HandleFunc("/auth/logout", logout).Methods("POST")

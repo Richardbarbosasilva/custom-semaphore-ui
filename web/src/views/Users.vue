@@ -16,6 +16,7 @@
           :need-save="needSave"
           :need-reset="needReset"
           :is-admin="true"
+          :can-manage-security="true"
           @hide-action-buttons="hideEditDialogButtons = true"
           @show-action-buttons="hideEditDialogButtons = false"
           :auth-methods="authMethods"

@@ -693,6 +693,44 @@ func assignMapToStructRecursive(m map[string]any, structValue reflect.Value) err
 				val := reflect.ValueOf(value)
 
 				switch fieldValue.Kind() {
+				case reflect.Pointer:
+					elemType := fieldValue.Type().Elem()
+
+					switch elemType.Kind() {
+					case reflect.Struct:
+						if val.Kind() != reflect.Map {
+							return fmt.Errorf("expected map for nested pointer field %s but got %T", field.Name, value)
+						}
+
+						mapValue, ok := value.(map[string]any)
+						if !ok {
+							return fmt.Errorf("cannot assign value of type %T to field %s of type %s", value, field.Name, field.Type)
+						}
+
+						if fieldValue.IsNil() {
+							fieldValue.Set(reflect.New(elemType))
+						}
+
+						if err := assignMapToStructRecursive(mapValue, fieldValue.Elem()); err != nil {
+							return err
+						}
+					default:
+						if val.Type().ConvertibleTo(elemType) {
+							newValue := reflect.New(elemType)
+							newValue.Elem().Set(val.Convert(elemType))
+							fieldValue.Set(newValue)
+						} else {
+							newVal, converted := CastValueToKind(val.Interface(), elemType.Kind())
+							if !converted {
+								return fmt.Errorf("cannot assign value of type %s to pointer field %s of type %s",
+									val.Type(), field.Name, field.Type)
+							}
+
+							newValue := reflect.New(elemType)
+							newValue.Elem().Set(reflect.ValueOf(newVal).Convert(elemType))
+							fieldValue.Set(newValue)
+						}
+					}
 				case reflect.Struct:
 
 					if val.Kind() != reflect.Map {

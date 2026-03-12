@@ -1,7 +1,10 @@
 package api
 
 import (
+	"bytes"
+	"encoding/base64"
 	"errors"
+	"image/png"
 	"net/http"
 	"strings"
 	"time"
@@ -9,11 +12,17 @@ import (
 	"github.com/pquerna/otp"
 	"github.com/semaphoreui/semaphore/api/helpers"
 	"github.com/semaphoreui/semaphore/db"
+	"github.com/semaphoreui/semaphore/pkg/tz"
 	proApi "github.com/semaphoreui/semaphore/pro/api"
 	"github.com/semaphoreui/semaphore/util"
 	log "github.com/sirupsen/logrus"
 
 	"github.com/pquerna/otp/totp"
+)
+
+const (
+	totpSetupCookieName     = "semaphore_totp_setup"
+	totpSetupFallbackWindow = 24 * time.Hour
 )
 
 func getSession(r *http.Request) (*db.Session, bool) {
@@ -68,6 +77,205 @@ type totpRequestBody struct {
 
 type totpRecoveryRequestBody struct {
 	RecoveryCode string `json:"recovery_code"`
+}
+
+type totpSetupCookiePayload struct {
+	UserID       int    `json:"user"`
+	SessionID    int    `json:"session"`
+	RecoveryCode string `json:"recovery_code,omitempty"`
+}
+
+type totpSetupResponse struct {
+	Secret       string `json:"secret"`
+	Issuer       string `json:"issuer"`
+	AccountName  string `json:"account_name"`
+	RecoveryCode string `json:"recovery_code,omitempty"`
+	QRCode       string `json:"qr_code,omitempty"`
+}
+
+func clearTotpSetupCookie(w http.ResponseWriter) {
+	http.SetCookie(w, &http.Cookie{
+		Name:     totpSetupCookieName,
+		Value:    "",
+		Expires:  tz.Now().Add(-7 * 24 * time.Hour),
+		Path:     "/",
+		HttpOnly: true,
+	})
+}
+
+func writeTotpSetupCookie(w http.ResponseWriter, session db.Session, recoveryCode string) error {
+	encoded, err := util.Cookie.Encode(totpSetupCookieName, totpSetupCookiePayload{
+		UserID:       session.UserID,
+		SessionID:    session.ID,
+		RecoveryCode: recoveryCode,
+	})
+	if err != nil {
+		return err
+	}
+
+	http.SetCookie(w, &http.Cookie{
+		Name:     totpSetupCookieName,
+		Value:    encoded,
+		Path:     "/",
+		HttpOnly: true,
+	})
+
+	return nil
+}
+
+func readTotpSetupCookie(r *http.Request) (*totpSetupCookiePayload, bool) {
+	cookie, err := r.Cookie(totpSetupCookieName)
+	if err != nil {
+		return nil, false
+	}
+
+	var payload totpSetupCookiePayload
+	if err = util.Cookie.Decode(totpSetupCookieName, cookie.Value, &payload); err != nil {
+		return nil, false
+	}
+
+	return &payload, true
+}
+
+func ensureUserTotpEnrollment(store db.Store, user db.User) (db.User, string, bool, error) {
+	if !util.GetTotpConfig().Enabled || user.Totp != nil {
+		return user, "", false, nil
+	}
+
+	issuer := "Semaphore"
+	if util.GetTotpConfig().Issuer != "" {
+		issuer = util.GetTotpConfig().Issuer
+	}
+
+	key, err := totp.Generate(totp.GenerateOpts{
+		Issuer:      issuer,
+		AccountName: user.Email,
+	})
+	if err != nil {
+		return user, "", false, err
+	}
+
+	var code string
+	var hash string
+
+	if util.GetTotpConfig().AllowRecovery {
+		code, hash, err = util.GenerateRecoveryCode()
+		if err != nil {
+			return user, "", false, err
+		}
+	}
+
+	newTotp, err := store.AddTotpVerification(user.ID, key.URL(), hash)
+	if err != nil {
+		return user, "", false, err
+	}
+
+	newTotp.RecoveryCode = code
+	user.Totp = &newTotp
+
+	return user, code, true, nil
+}
+
+func getTotpSetupState(r *http.Request) (*db.Session, *db.User, *totpSetupCookiePayload, bool) {
+	session, ok := getSession(r)
+	if !ok || session.VerificationMethod != db.SessionVerificationTotp || session.Verified {
+		return nil, nil, nil, false
+	}
+
+	user, err := helpers.Store(r).GetUser(session.UserID)
+	if err != nil || user.Totp == nil {
+		return nil, nil, nil, false
+	}
+
+	payload, ok := readTotpSetupCookie(r)
+	if ok && payload.UserID == session.UserID && payload.SessionID == session.ID {
+		return session, &user, payload, true
+	}
+
+	// Grace window for newly provisioned TOTP secrets. This also recovers users
+	// who first logged in while the setup cookie was not yet being written.
+	if tz.Now().Sub(user.Totp.Created) <= totpSetupFallbackWindow {
+		return session, &user, &totpSetupCookiePayload{
+			UserID:    session.UserID,
+			SessionID: session.ID,
+		}, true
+	}
+
+	return nil, nil, nil, false
+}
+
+func getTotpSetup(w http.ResponseWriter, r *http.Request) {
+	_, user, payload, ok := getTotpSetupState(r)
+	if !ok {
+		w.WriteHeader(http.StatusNotFound)
+		return
+	}
+
+	setup, err := buildTotpSetupResponse(*user, payload.RecoveryCode)
+	if err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+
+	helpers.WriteJSON(w, http.StatusOK, setup)
+}
+
+func getTotpSetupQr(w http.ResponseWriter, r *http.Request) {
+	_, user, _, ok := getTotpSetupState(r)
+	if !ok {
+		w.WriteHeader(http.StatusNotFound)
+		return
+	}
+
+	key, err := otp.NewKeyFromURL(user.Totp.URL)
+	if err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+
+	image, err := key.Image(256, 256)
+	if err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+
+	var buf bytes.Buffer
+	err = png.Encode(&buf, image)
+	if err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Add("Content-Type", "image/png")
+	_, err = w.Write(buf.Bytes())
+	if err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+	}
+}
+
+func buildTotpSetupResponse(user db.User, recoveryCode string) (totpSetupResponse, error) {
+	key, err := otp.NewKeyFromURL(user.Totp.URL)
+	if err != nil {
+		return totpSetupResponse{}, err
+	}
+
+	image, err := key.Image(256, 256)
+	if err != nil {
+		return totpSetupResponse{}, err
+	}
+
+	var buf bytes.Buffer
+	if err = png.Encode(&buf, image); err != nil {
+		return totpSetupResponse{}, err
+	}
+
+	return totpSetupResponse{
+		Secret:       key.Secret(),
+		Issuer:       key.Issuer(),
+		AccountName:  key.AccountName(),
+		RecoveryCode: recoveryCode,
+		QRCode:       "data:image/png;base64," + base64.StdEncoding.EncodeToString(buf.Bytes()),
+	}, nil
 }
 
 // recoverySession handles the recovery of a user session using a recovery code.
@@ -143,8 +351,10 @@ func recoverySession(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
+		clearTotpSetupCookie(w)
 		w.WriteHeader(http.StatusNoContent)
 	case db.SessionVerificationNone:
+		clearTotpSetupCookie(w)
 		w.WriteHeader(http.StatusNoContent)
 		return
 	default:
@@ -183,6 +393,11 @@ func verifySession(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
+		if user.Totp == nil {
+			helpers.WriteErrorStatus(w, "TOTP_SETUP_REQUIRED", http.StatusUnauthorized)
+			return
+		}
+
 		key, err := otp.NewKeyFromURL(user.Totp.URL)
 		if err != nil {
 			w.WriteHeader(http.StatusInternalServerError)
@@ -200,7 +415,10 @@ func verifySession(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
+		clearTotpSetupCookie(w)
+
 	case db.SessionVerificationNone:
+		clearTotpSetupCookie(w)
 		w.WriteHeader(http.StatusNoContent)
 		return
 	default:

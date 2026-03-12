@@ -37,6 +37,7 @@
           :need-reset="needReset"
           :is-admin="user.admin"
           :auth-methods="(systemInfo || { auth_methods: {} }).auth_methods"
+          :can-manage-security="user.admin || ((userRole || {}).role === 'owner')"
           @hide-action-buttons="hideUserDialogButtons = true"
           @show-action-buttons="hideUserDialogButtons = false"
         />

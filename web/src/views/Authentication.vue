@@ -187,6 +187,29 @@
               do usuário retornado pelo diretório.
             </div>
 
+            <div class="auth-admin__mapping-tools">
+              <v-btn
+                small
+                text
+                color="primary"
+                class="px-0"
+                @click="applyActiveDirectoryPreset()"
+              >
+                Aplicar preset de Active Directory
+              </v-btn>
+            </div>
+
+            <v-alert
+              v-if="ldapMappingNeedsAttention"
+              dense
+              text
+              color="warning"
+              class="mt-2 mb-0"
+            >
+              O filtro indica Active Directory, mas o mapeamento ainda parece genérico.
+              Para este cenário, use `sAMAccountName`, `displayName` e `distinguishedName`.
+            </v-alert>
+
             <v-row dense class="mt-1">
               <v-col cols="12" md="3">
                 <v-text-field
@@ -328,8 +351,9 @@
             />
 
             <div class="auth-admin__note auth-admin__note--primary">
-              Quando o TOTP está ativo, cada usuário pode habilitar o QR code na
-              própria conta em Segurança.
+              Quando o TOTP está ativo, cada usuário precisa habilitar o segundo
+              fator na própria conta em Segurança. O QR code e o recovery code
+              aparecem nessa tela do usuário; eles não são enviados por email.
             </div>
           </v-card>
 
@@ -445,9 +469,31 @@ export default {
 
       return 'Informe a senha apenas se o Bind DN exigir autenticação.';
     },
+
+    ldapMappingNeedsAttention() {
+      const filter = (this.form.ldap.search_filter || '').toLowerCase();
+      if (!filter.includes('samaccountname')) {
+        return false;
+      }
+
+      const mappings = this.form.ldap.mappings || {};
+      return mappings.uid === 'uid'
+        || mappings.cn === 'cn'
+        || mappings.dn === 'dn';
+    },
   },
 
   methods: {
+    applyActiveDirectoryPreset() {
+      this.form.ldap.search_filter = '(&(objectClass=user)(sAMAccountName=%s))';
+      this.form.ldap.mappings = {
+        dn: 'distinguishedName',
+        uid: 'sAMAccountName',
+        cn: 'displayName',
+        mail: 'mail',
+      };
+    },
+
     getPayload() {
       return {
         ldap: {

@@ -101,8 +101,53 @@ type ldapTestUserPreview struct {
 	Email    string `json:"email"`
 }
 
+const (
+	defaultLDAPDNMapping     = "dn"
+	defaultLDAPMailMapping   = "mail"
+	defaultLDAPUIDMapping    = "uid"
+	defaultLDAPCNMapping     = "cn"
+	defaultADDNMapping       = "distinguishedName"
+	defaultADMailMapping     = "mail"
+	defaultADUIDMapping      = "sAMAccountName"
+	defaultADCNMapping       = "displayName"
+	defaultADSearchFilter    = "(&(objectClass=user)(sAMAccountName=%s))"
+	defaultGenericLDAPFilter = "(uid=%s)"
+)
+
+func looksLikeActiveDirectory(filter string) bool {
+	return strings.Contains(strings.ToLower(strings.TrimSpace(filter)), "samaccountname")
+}
+
+func defaultLDAPMappingsForFilter(filter string) util.LdapMappings {
+	if looksLikeActiveDirectory(filter) {
+		return util.LdapMappings{
+			DN:   defaultADDNMapping,
+			Mail: defaultADMailMapping,
+			UID:  defaultADUIDMapping,
+			CN:   defaultADCNMapping,
+		}
+	}
+
+	return util.LdapMappings{
+		DN:   defaultLDAPDNMapping,
+		Mail: defaultLDAPMailMapping,
+		UID:  defaultLDAPUIDMapping,
+		CN:   defaultLDAPCNMapping,
+	}
+}
+
+func normalizeLDAPMappingValue(value string, fallback string, useFallbackFor string) string {
+	trimmedValue := strings.TrimSpace(value)
+	if trimmedValue == "" || strings.EqualFold(trimmedValue, useFallbackFor) {
+		return fallback
+	}
+
+	return trimmedValue
+}
+
 func getDefaultLdapMappings() ldapMappingsResponse {
-	mappings := util.GetLdapMappings()
+	normalized := normalizeLDAPConfig(getCurrentLDAPRuntimeConfig())
+	mappings := normalized.Mappings
 
 	return ldapMappingsResponse{
 		DN:   mappings.DN,
@@ -113,17 +158,18 @@ func getDefaultLdapMappings() ldapMappingsResponse {
 }
 
 func getCurrentAuthSettings() authSettingsResponse {
+	ldapCfg := normalizeLDAPConfig(getCurrentLDAPRuntimeConfig())
 	totp := util.GetTotpConfig()
 
 	return authSettingsResponse{
 		LDAP: ldapSettingsResponse{
-			Enabled:         util.Config.LdapEnable,
-			Server:          util.Config.LdapServer,
-			NeedTLS:         util.Config.LdapNeedTLS,
-			BindDN:          util.Config.LdapBindDN,
+			Enabled:         ldapCfg.Enabled,
+			Server:          ldapCfg.Server,
+			NeedTLS:         ldapCfg.NeedTLS,
+			BindDN:          ldapCfg.BindDN,
 			HasBindPassword: util.Config.LdapBindPassword != "",
-			SearchDN:        util.Config.LdapSearchDN,
-			SearchFilter:    util.Config.LdapSearchFilter,
+			SearchDN:        ldapCfg.SearchDN,
+			SearchFilter:    ldapCfg.SearchFilter,
 			Mappings:        getDefaultLdapMappings(),
 		},
 		Totp: totpSettingsResponse{
@@ -182,25 +228,20 @@ func getCurrentLDAPRuntimeConfig() ldapRuntimeConfig {
 }
 
 func normalizeLDAPConfig(cfg ldapRuntimeConfig) ldapRuntimeConfig {
+	defaultMappings := defaultLDAPMappingsForFilter(cfg.SearchFilter)
+
 	if cfg.SearchFilter == "" {
-		cfg.SearchFilter = "(uid=%s)"
+		if looksLikeActiveDirectory(cfg.SearchFilter) {
+			cfg.SearchFilter = defaultADSearchFilter
+		} else {
+			cfg.SearchFilter = defaultGenericLDAPFilter
+		}
 	}
 
-	if cfg.Mappings.DN == "" {
-		cfg.Mappings.DN = "dn"
-	}
-
-	if cfg.Mappings.UID == "" {
-		cfg.Mappings.UID = "uid"
-	}
-
-	if cfg.Mappings.CN == "" {
-		cfg.Mappings.CN = "cn"
-	}
-
-	if cfg.Mappings.Mail == "" {
-		cfg.Mappings.Mail = "mail"
-	}
+	cfg.Mappings.DN = normalizeLDAPMappingValue(cfg.Mappings.DN, defaultMappings.DN, defaultLDAPDNMapping)
+	cfg.Mappings.UID = normalizeLDAPMappingValue(cfg.Mappings.UID, defaultMappings.UID, defaultLDAPUIDMapping)
+	cfg.Mappings.CN = normalizeLDAPMappingValue(cfg.Mappings.CN, defaultMappings.CN, defaultLDAPCNMapping)
+	cfg.Mappings.Mail = normalizeLDAPMappingValue(cfg.Mappings.Mail, defaultMappings.Mail, defaultLDAPMailMapping)
 
 	return cfg
 }
@@ -325,7 +366,7 @@ func findLDAPUserWithConfig(cfg ldapRuntimeConfig, username string, password str
 
 	prepareClaims(entry)
 
-	claims, err := parseClaims(entry, &cfg.Mappings)
+	claims, err := parseLDAPClaims(entry, &cfg.Mappings, username)
 	if err != nil {
 		return nil, err
 	}

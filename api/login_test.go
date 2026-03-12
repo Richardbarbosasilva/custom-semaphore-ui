@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/semaphoreui/semaphore/util"
 	"github.com/stretchr/testify/assert"
 )
 
@@ -173,4 +174,43 @@ func TestGenerateStateOauthCookieUniqueness(t *testing.T) {
 
 	// Verify states are different
 	assert.NotEqual(t, state1Str, state2Str, "Multiple calls should generate different state strings")
+}
+
+func TestGetLDAPFallbackUsername(t *testing.T) {
+	assert.Equal(t, "richard.silva", getLDAPFallbackUsername(`CLICKIP\\richard.silva`, ""))
+	assert.Equal(t, "richard.silva", getLDAPFallbackUsername("richard.silva@clickip.com.br", ""))
+	assert.Equal(t, "richard.silva", getLDAPFallbackUsername("", "richard.silva@clickip.com.br"))
+}
+
+func TestParseLDAPClaimsUsesStableFallbackUsername(t *testing.T) {
+	claims := map[string]any{
+		"mail": "richard.silva@clickip.com.br",
+	}
+
+	res, err := parseLDAPClaims(claims, &util.LdapMappings{
+		UID:  "uid",
+		Mail: "mail",
+		CN:   "displayName",
+	}, "richard.silva")
+
+	assert.NoError(t, err)
+	assert.Equal(t, "richard.silva", res.username)
+	assert.Equal(t, "richard.silva@clickip.com.br", res.email)
+}
+
+func TestNormalizeLDAPConfigUsesActiveDirectoryMappings(t *testing.T) {
+	cfg := normalizeLDAPConfig(ldapRuntimeConfig{
+		SearchFilter: defaultADSearchFilter,
+		Mappings: util.LdapMappings{
+			DN:   "dn",
+			UID:  "uid",
+			CN:   "cn",
+			Mail: "mail",
+		},
+	})
+
+	assert.Equal(t, defaultADUIDMapping, cfg.Mappings.UID)
+	assert.Equal(t, defaultADCNMapping, cfg.Mappings.CN)
+	assert.Equal(t, defaultADDNMapping, cfg.Mappings.DN)
+	assert.Equal(t, defaultADMailMapping, cfg.Mappings.Mail)
 }

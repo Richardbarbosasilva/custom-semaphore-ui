@@ -86,8 +86,8 @@
       </v-row>
 
       <v-row dense class="mt-1">
-        <v-col cols="12" lg="8">
-          <v-card class="overview-panel" outlined>
+        <v-col cols="12" lg="6">
+          <v-card class="overview-panel overview-panel--stretch" outlined>
             <div class="overview-panel__header">
               <div>
                 <div class="overview-panel__title">{{ $t('overview_execution_trend') }}</div>
@@ -102,7 +102,7 @@
               </div>
             </div>
 
-            <div class="overview-chart-wrapper">
+            <div class="overview-chart-wrapper overview-chart-wrapper--compact">
               <OverviewTrendChart
                 :source-data="normalizedStats"
                 :dark="$vuetify.theme.dark"
@@ -111,8 +111,8 @@
           </v-card>
         </v-col>
 
-        <v-col cols="12" lg="4">
-          <v-card class="overview-panel" outlined>
+        <v-col cols="12" lg="6">
+          <v-card class="overview-panel overview-panel--stretch" outlined>
             <div class="overview-panel__title">{{ $t('overview_status_breakdown') }}</div>
             <div class="overview-panel__subtitle">
               {{ $t('overview_status_breakdown_subtitle') }}
@@ -143,8 +143,10 @@
               </div>
             </div>
           </v-card>
+        </v-col>
 
-          <v-card class="overview-panel mt-4" outlined>
+        <v-col cols="12" lg="6">
+          <v-card class="overview-panel overview-panel--stretch" outlined>
             <div class="overview-panel__title">{{ $t('overview_top_templates') }}</div>
             <div class="overview-panel__subtitle">{{ $t('overview_top_templates_subtitle') }}</div>
 
@@ -176,6 +178,54 @@
               <div class="overview-template-row__time">
                 {{ item.lastStarted | formatDate }}
               </div>
+            </div>
+          </v-card>
+        </v-col>
+
+        <v-col cols="12" lg="6">
+          <v-card class="overview-panel overview-panel--stretch" outlined>
+            <div class="overview-panel__title">{{ $t('overview_top_users') }}</div>
+            <div class="overview-panel__subtitle">{{ $t('overview_top_users_subtitle') }}</div>
+
+            <div v-if="topUsers.length === 0" class="overview-empty-state">
+              {{ $t('overview_no_users') }}
+            </div>
+
+            <div
+              v-for="item in topUsers"
+              :key="item.userKey"
+              class="overview-user-row"
+            >
+              <div class="overview-user-row__header">
+                <div class="overview-user-row__identity">
+                  <div class="overview-user-row__avatar">
+                    {{ getUserInitials(item.name) }}
+                  </div>
+
+                  <div class="overview-user-row__body">
+                    <div class="overview-user-row__name">{{ item.name }}</div>
+                    <div class="overview-user-row__meta">
+                      {{ $t('overview_runs_count', { count: item.count }) }}
+                      •
+                      {{
+                        $t('overview_success_rate_compact', {
+                          rate: item.successRate.toFixed(1),
+                        })
+                      }}
+                    </div>
+                  </div>
+                </div>
+
+                <div class="overview-user-row__count">{{ formatNumber(item.count) }}</div>
+              </div>
+
+              <v-progress-linear
+                :value="item.share"
+                color="#42a5f5"
+                rounded
+                height="8"
+                class="overview-user-row__bar"
+              />
             </div>
           </v-card>
         </v-col>
@@ -392,6 +442,10 @@
   padding: 22px;
 }
 
+.overview-panel--stretch {
+  height: 100%;
+}
+
 .overview-panel__header {
   align-items: flex-start;
   display: flex;
@@ -434,6 +488,10 @@
   margin-top: 20px;
 }
 
+.overview-chart-wrapper--compact {
+  height: 300px;
+}
+
 .overview-status-list {
   margin-top: 18px;
 }
@@ -470,6 +528,14 @@
   border-top: 1px solid rgba(96, 125, 139, 0.14);
 }
 
+.overview-user-row {
+  padding: 16px 0;
+}
+
+.overview-user-row + .overview-user-row {
+  border-top: 1px solid rgba(96, 125, 139, 0.14);
+}
+
 .overview-template-row__icon {
   align-items: center;
   background: rgba(0, 80, 87, 0.08);
@@ -479,6 +545,60 @@
   height: 38px;
   justify-content: center;
   width: 38px;
+}
+
+.overview-user-row__header {
+  align-items: center;
+  display: flex;
+  gap: 16px;
+  justify-content: space-between;
+}
+
+.overview-user-row__identity {
+  align-items: center;
+  display: flex;
+  gap: 12px;
+  min-width: 0;
+}
+
+.overview-user-row__avatar {
+  align-items: center;
+  background: linear-gradient(135deg, rgba(58, 123, 213, 0.2), rgba(0, 210, 255, 0.18));
+  border-radius: 14px;
+  color: #1565c0;
+  display: inline-flex;
+  font-size: 13px;
+  font-weight: 800;
+  height: 40px;
+  justify-content: center;
+  letter-spacing: 0.04em;
+  width: 40px;
+}
+
+.overview-user-row__body {
+  min-width: 0;
+}
+
+.overview-user-row__name {
+  color: #102027;
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.overview-user-row__meta,
+.overview-user-row__count {
+  color: #78909c;
+  font-size: 12px;
+}
+
+.overview-user-row__count {
+  font-weight: 700;
+}
+
+.overview-user-row__bar {
+  margin-top: 10px;
 }
 
 .overview-template-row__body {
@@ -535,7 +655,8 @@
 
   .overview-metric-card__value,
   .overview-panel__title,
-  .overview-panel__summary-value {
+  .overview-panel__summary-value,
+  .overview-user-row__name {
     color: #eceff1;
   }
 
@@ -550,6 +671,8 @@
   .overview-status-row__footer,
   .overview-template-row__meta,
   .overview-template-row__time,
+  .overview-user-row__meta,
+  .overview-user-row__count,
   .overview-empty-state,
   .overview-task__meta,
   .overview-metric-card__caption {
@@ -557,6 +680,10 @@
   }
 
   .overview-template-row + .overview-template-row {
+    border-top-color: rgba(255, 255, 255, 0.08);
+  }
+
+  .overview-user-row + .overview-user-row {
     border-top-color: rgba(255, 255, 255, 0.08);
   }
 
@@ -573,6 +700,10 @@
 
   .overview-user-filter .v-input__slot {
     background: rgba(12, 21, 34, 0.52) !important;
+  }
+
+  .overview-user-row__avatar {
+    color: #90caf9;
   }
 }
 
@@ -819,6 +950,52 @@ export default {
           return dayjs(b.lastStarted).valueOf() - dayjs(a.lastStarted).valueOf();
         })
         .slice(0, 5);
+    },
+
+    topUsers() {
+      const aggregated = this.currentRangeTasks
+        .reduce((acc, task) => {
+          const userKey = String(task.user_id || task.user_name || task.username || 'unknown');
+          const current = acc[userKey] || {
+            userKey,
+            id: task.user_id || null,
+            name: task.user_name || task.username || this.$t('user'),
+            count: 0,
+            success: 0,
+            lastStarted: task.start || task.created,
+          };
+
+          current.count += 1;
+
+          if (task.status === 'success') {
+            current.success += 1;
+          }
+
+          if (dayjs(task.start || task.created).isAfter(dayjs(current.lastStarted))) {
+            current.lastStarted = task.start || task.created;
+          }
+
+          acc[userKey] = current;
+          return acc;
+        }, {});
+
+      const rows = Object.values(aggregated)
+        .sort((a, b) => {
+          if (b.count !== a.count) {
+            return b.count - a.count;
+          }
+
+          return dayjs(b.lastStarted).valueOf() - dayjs(a.lastStarted).valueOf();
+        })
+        .slice(0, 5);
+
+      const maxCount = rows.reduce((max, row) => Math.max(max, row.count), 0) || 1;
+
+      return rows.map((row) => ({
+        ...row,
+        successRate: this.getRate(row.success, row.count),
+        share: (row.count / maxCount) * 100,
+      }));
     },
 
     statusBreakdown() {
@@ -1159,6 +1336,20 @@ export default {
 
     getTaskDateValue(task) {
       return dayjs(this.getTaskDate(task)).valueOf() || 0;
+    },
+
+    getUserInitials(name) {
+      const source = (name || '')
+        .split(' ')
+        .map((part) => part.trim())
+        .filter(Boolean)
+        .slice(0, 2);
+
+      if (source.length === 0) {
+        return '??';
+      }
+
+      return source.map((part) => part[0].toUpperCase()).join('');
     },
   },
 };

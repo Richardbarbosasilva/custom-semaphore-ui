@@ -24,7 +24,7 @@
       <v-tab key="settings">Settings</v-tab>
       <v-tab
         key="2fa"
-        v-if="!isNew || authMethods.totp"
+        v-if="showSecurityTab"
       >
         Security
       </v-tab>
@@ -133,7 +133,7 @@
         </v-form>
       </v-tab-item>
 
-      <v-tab-item key="2fa" v-if="item != null">
+      <v-tab-item key="2fa" v-if="item != null && showSecurityTab">
 
         <div v-if="!isNew">
           <div class="title mb-3">Password</div>
@@ -146,11 +146,33 @@
         >
           <div class="title mb-2">Two-factor authentication</div>
 
+          <v-alert
+            dense
+            text
+            color="info"
+            class="mb-4"
+          >
+            O QR code nao e enviado por email. Ative o TOTP neste usuario,
+            escaneie o QR code ou copie a chave manual e guarde o recovery code
+            antes de sair da sessao.
+          </v-alert>
+
           <v-switch
             class="mt-0"
             v-model="totpEnabled"
             label="Time-based one-time password"
           ></v-switch>
+
+          <v-btn
+            v-if="item.totp != null"
+            small
+            text
+            color="primary"
+            class="mb-4 px-0"
+            @click="totpSetupDialog = true"
+          >
+            Abrir instrucoes de configuracao
+          </v-btn>
 
           <img
             v-if="totpQrUrl"
@@ -166,6 +188,25 @@
       "
             alt="QR code"
           />
+
+          <div
+            v-if="totpSecret"
+            class="mt-5 pb-3"
+          >
+            <div class="subtitle-1 mb-2">Manual setup key</div>
+            <div style="position: relative;">
+              <code style="font-size: 16px; background-color: #183149; color: #ffffff;">
+                {{ totpSecret }}
+              </code>
+
+              <CopyClipboardButton
+                style="position: absolute; right: -4px; top: -12px;"
+                :text="totpSecret"
+                large
+                color="white"
+              />
+            </div>
+          </div>
 
           <div
             v-if="authMethods.totp.allow_recovery && item.totp && item.totp.recovery_code"
@@ -187,9 +228,100 @@
               />
             </div>
           </div>
+
+          <v-alert
+            v-else-if="item.totp != null && authMethods.totp.allow_recovery"
+            dense
+            text
+            color="warning"
+            class="mt-4 mb-0"
+          >
+            O recovery code so e exibido no momento da ativacao. Se ele nao foi
+            salvo, um administrador precisara desativar e habilitar o TOTP novamente.
+          </v-alert>
         </div>
       </v-tab-item>
     </v-tabs-items>
+
+    <v-dialog
+      v-model="totpSetupDialog"
+      max-width="540"
+      v-if="item && item.totp"
+    >
+      <v-card class="pa-3">
+        <v-card-title class="pb-2">
+          Configuracao do TOTP
+        </v-card-title>
+
+        <v-card-text>
+          <v-alert dense text color="info" class="mb-4">
+            Use Google Authenticator, Authy ou app equivalente. Nada e enviado por email.
+          </v-alert>
+
+          <img
+            v-if="totpQrUrl"
+            :src="totpQrUrl"
+            style="
+              width: 100%;
+              max-width: 280px;
+              aspect-ratio: 1;
+              border-radius: 10px;
+              display: block;
+              margin: 0 auto 16px auto;
+              border: 10px solid white;
+              background-color: white;
+            "
+            alt="QR code"
+          />
+
+          <div v-if="totpSecret" class="mb-5">
+            <div class="subtitle-1 mb-2">Chave manual</div>
+            <div style="position: relative;">
+              <code style="font-size: 16px; background-color: #183149; color: #ffffff;">
+                {{ totpSecret }}
+              </code>
+
+              <CopyClipboardButton
+                style="position: absolute; right: -4px; top: -12px;"
+                :text="totpSecret"
+                large
+                color="white"
+              />
+            </div>
+          </div>
+
+          <div
+            v-if="authMethods.totp.allow_recovery && item.totp.recovery_code"
+            class="mb-3"
+          >
+            <div class="subtitle-1 mb-2">Recovery code</div>
+            <div style="position: relative;">
+              <code style="font-size: 18px; background-color: #e03755;">
+                {{ item.totp.recovery_code }}
+              </code>
+
+              <CopyClipboardButton
+                style="position: absolute; right: -4px; top: -12px;"
+                :text="item.totp.recovery_code"
+                large
+                color="white"
+              />
+            </div>
+          </div>
+
+          <v-alert dense text color="warning" class="mb-0">
+            Termine o pareamento no aplicativo autenticador antes de encerrar a sessao.
+          </v-alert>
+        </v-card-text>
+
+        <v-card-actions>
+          <v-spacer />
+          <v-btn text color="primary" @click="totpSetupDialog = false">
+            Fechar
+          </v-btn>
+        </v-card-actions>
+      </v-card>
+    </v-dialog>
   </div>
 </template>
 <script>
@@ -198,12 +330,15 @@ import axios from 'axios';
 import EditDialog from '@/components/EditDialog.vue';
 import ChangePasswordForm from '@/components/ChangePasswordForm.vue';
 import CopyClipboardButton from '@/components/CopyClipboardButton.vue';
+import EventBus from '@/event-bus';
+import { getErrorMessage } from '@/lib/error';
 
 export default {
   components: { CopyClipboardButton, ChangePasswordForm, EditDialog },
   props: {
     isAdmin: Boolean,
     authMethods: Object,
+    canManageSecurity: Boolean,
   },
 
   mixins: [ItemFormBase],
@@ -213,6 +348,7 @@ export default {
       passwordDialog: null,
       totpEnabled: false,
       totpQrUrl: null,
+      totpSetupDialog: false,
 
       tab: null,
     };
@@ -228,29 +364,34 @@ export default {
     },
 
     async totpEnabled(val) {
-      if (val) {
-        if (this.item.totp == null) {
-          this.item.totp = (await axios({
-            method: 'post',
-            url: `/api/users/${this.itemId}/2fas/totp`,
+      try {
+        if (val) {
+          if (this.item.totp == null) {
+            this.item.totp = (await axios({
+              method: 'post',
+              url: `/api/users/${this.itemId}/2fas/totp`,
+              responseType: 'json',
+            })).data;
+
+            this.totpQrUrl = `${document.baseURI}api/users/${this.itemId}/2fas/totp/${this.item.totp.id}/qr`;
+            this.totpSetupDialog = true;
+          }
+        } else if (this.item.totp != null) {
+          await axios({
+            method: 'delete',
+            url: `/api/users/${this.itemId}/2fas/totp/${this.item.totp.id}`,
             responseType: 'json',
-          })).data;
-
-          // let baseURI = document.baseURI;
-          // if (baseURI.endsWith('/')) {
-          //   baseURI = baseURI.substring(0, baseURI.length - 1);
-          // }
-
-          this.totpQrUrl = `${document.baseURI}api/users/${this.itemId}/2fas/totp/${this.item.totp.id}/qr`;
+          });
+          this.item.totp = null;
+          this.totpQrUrl = null;
+          this.totpSetupDialog = false;
         }
-      } else if (this.item.totp != null) {
-        await axios({
-          method: 'delete',
-          url: `/api/users/${this.itemId}/2fas/totp/${this.item.totp.id}`,
-          responseType: 'json',
+      } catch (error) {
+        this.totpEnabled = this.item.totp != null;
+        EventBus.$emit('i-snackbar', {
+          color: 'error',
+          text: getErrorMessage(error),
         });
-        this.item.totp = null;
-        this.totpQrUrl = null;
       }
     },
   },
@@ -261,6 +402,19 @@ export default {
       return (process.env.VUE_APP_BUILD_TYPE || '').startsWith('pro_');
     },
 
+    showSecurityTab() {
+      return this.canManageSecurity && (!this.isNew || this.authMethods.totp);
+    },
+
+    totpSecret() {
+      if (!this.item || !this.item.totp || !this.item.totp.url) {
+        return null;
+      }
+
+      const match = this.item.totp.url.match(/[?&]secret=([^&]+)/);
+      return match ? decodeURIComponent(match[1]) : null;
+    },
+
   },
 
   methods: {
@@ -269,6 +423,7 @@ export default {
       if (this.item.totp == null) {
         this.totpEnabled = false;
         this.totpQrUrl = null;
+        this.totpSetupDialog = false;
       } else {
         this.totpEnabled = true;
         this.totpQrUrl = `${document.baseURI}api/users/${this.itemId}/2fas/totp/${this.item.totp.id}/qr`;

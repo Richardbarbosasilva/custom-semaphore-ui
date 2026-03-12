@@ -131,6 +131,62 @@
                     get your verification code.
                   </div>
 
+                  <v-alert
+                    v-if="verificationMethod === 'totp'"
+                    dense
+                    text
+                    color="info"
+                    class="mb-4"
+                  >
+                    O QR code não é enviado por e-mail. Se este for o primeiro login
+                    com TOTP obrigatório, configure o aplicativo abaixo antes de
+                    continuar.
+                  </v-alert>
+
+                  <div
+                    v-if="verificationMethod === 'totp' && totpSetup"
+                    class="auth__totp-setup"
+                  >
+                    <div class="auth__totp-setup-title">Configure seu autenticador</div>
+                    <div class="auth__totp-setup-copy">
+                      Escaneie o QR code com o Google Authenticator, Authy ou app equivalente.
+                      Depois, informe o código de 6 dígitos para concluir o login.
+                    </div>
+
+                    <img
+                      v-if="totpSetupQrUrl"
+                      :src="totpSetupQrUrl"
+                      alt="QR code TOTP"
+                      class="auth__totp-setup-qr"
+                    />
+
+                    <div class="auth__totp-setup-label">Chave manual</div>
+                    <div class="auth__totp-setup-secret">{{ totpSetup.secret }}</div>
+                    <v-btn
+                      small
+                      text
+                      color="primary"
+                      class="mb-4"
+                      @click="copyToClipboard(totpSetup.secret)"
+                    >
+                      Copiar chave manual
+                    </v-btn>
+
+                    <template v-if="totpSetup.recovery_code">
+                      <div class="auth__totp-setup-label">Recovery code</div>
+                      <div class="auth__totp-setup-secret">{{ totpSetup.recovery_code }}</div>
+                      <v-btn
+                        small
+                        text
+                        color="primary"
+                        class="mb-4"
+                        @click="copyToClipboard(totpSetup.recovery_code)"
+                      >
+                        Copiar recovery code
+                      </v-btn>
+                    </template>
+                  </div>
+
                   <div
                     v-else-if="isPortal && verificationMethod === 'email'"
                     class="text-center mb-4"
@@ -496,6 +552,58 @@
   margin-top: 12px;
 }
 
+.auth__totp-setup {
+  background: rgba(255, 255, 255, 0.54);
+  border: 1px solid rgba(24, 49, 73, 0.14);
+  border-radius: 18px;
+  margin-bottom: 18px;
+  padding: 18px;
+}
+
+.auth__totp-setup-title {
+  color: #0f172a;
+  font-size: 16px;
+  font-weight: 700;
+}
+
+.auth__totp-setup-copy {
+  color: #64748b;
+  font-size: 13px;
+  line-height: 1.6;
+  margin-top: 8px;
+}
+
+.auth__totp-setup-qr {
+  aspect-ratio: 1;
+  background: #ffffff;
+  border: 10px solid #ffffff;
+  border-radius: 14px;
+  display: block;
+  margin: 18px auto 16px;
+  max-width: 220px;
+  width: 100%;
+}
+
+.auth__totp-setup-label {
+  color: #475569;
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  margin-bottom: 8px;
+  margin-top: 12px;
+  text-transform: uppercase;
+}
+
+.auth__totp-setup-secret {
+  background: #183149;
+  border-radius: 12px;
+  color: #ffffff;
+  font-family: monospace;
+  font-size: 13px;
+  line-break: anywhere;
+  padding: 12px 14px;
+}
+
 @media (max-width: 1200px) {
   .auth__hero-title {
     font-size: 42px;
@@ -572,6 +680,8 @@ export default {
       verificationCode: null,
       verificationMethod: null,
       recoveryCode: null,
+      totpSetup: null,
+      totpSetupQrUrl: null,
       verificationEmailSending: false,
       authHeroLogo,
       authPanelLogo,
@@ -591,9 +701,7 @@ export default {
         await this.loadLoginData();
         break;
       case 'unverified':
-        this.screen = 'verification';
-        this.verificationMethod = verificationMethod;
-        await this.loadLoginData();
+        await this.openVerificationScreen(verificationMethod);
         break;
       default:
         throw new Error(`Unknown authentication status: ${status}`);
@@ -613,6 +721,82 @@ export default {
   },
 
   methods: {
+    async openVerificationScreen(verificationMethod, initialTotpSetup = null) {
+      this.screen = 'verification';
+      this.verificationMethod = verificationMethod;
+      this.totpSetup = initialTotpSetup;
+      this.totpSetupQrUrl = initialTotpSetup ? initialTotpSetup.qr_code || null : null;
+      await this.loadLoginData();
+
+      if (verificationMethod === 'totp' && !initialTotpSetup) {
+        await this.loadTotpSetup();
+      }
+    },
+
+    async loadTotpSetup() {
+      this.totpSetup = null;
+      this.totpSetupQrUrl = null;
+
+      try {
+        const response = await axios({
+          method: 'get',
+          url: '/api/auth/totp/setup',
+          responseType: 'json',
+        });
+
+        this.totpSetup = response.data;
+        this.totpSetupQrUrl = response.data.qr_code || `${document.baseURI}api/auth/totp/setup/qr?ts=${Date.now()}`;
+      } catch (error) {
+        if (!error.response || error.response.status !== 404) {
+          throw error;
+        }
+      }
+    },
+
+    async continueAfterPasswordLogin(initialTotpSetup = null) {
+      const { status, verificationMethod } = await this.getAuthenticationStatus();
+
+      if (status === 'authenticated') {
+        this.redirectAfterLogin();
+        return;
+      }
+
+      if (status === 'unverified') {
+        await this.openVerificationScreen(verificationMethod, initialTotpSetup);
+        return;
+      }
+
+      this.redirectAfterLogin();
+    },
+
+    async copyToClipboard(value) {
+      try {
+        if (navigator.clipboard && window.isSecureContext) {
+          await navigator.clipboard.writeText(value);
+        } else {
+          const input = document.createElement('textarea');
+          input.value = value;
+          input.setAttribute('readonly', '');
+          input.style.position = 'absolute';
+          input.style.left = '-9999px';
+          document.body.appendChild(input);
+          input.select();
+          document.execCommand('copy');
+          document.body.removeChild(input);
+        }
+
+        EventBus.$emit('i-snackbar', {
+          color: 'success',
+          text: 'Valor copiado para a area de transferencia.',
+        });
+      } catch (error) {
+        EventBus.$emit('i-snackbar', {
+          color: 'error',
+          text: getErrorMessage(error),
+        });
+      }
+    },
+
     async resendEmailVerification() {
       if (this.verificationEmailSending) {
         return;
@@ -777,7 +961,7 @@ export default {
           },
         });
 
-        this.redirectAfterLogin();
+        await this.continueAfterPasswordLogin();
       } catch (err) {
         if (err.response.status === 401) {
           this.signInError = this.$t('incorrectEmail');
@@ -798,7 +982,7 @@ export default {
 
       this.signInProcess = true;
       try {
-        await axios({
+        const response = await axios({
           method: 'post',
           url: '/api/auth/login',
           responseType: 'json',
@@ -808,7 +992,7 @@ export default {
           },
         });
 
-        this.redirectAfterLogin();
+        await this.continueAfterPasswordLogin(response.data ? response.data.totp_setup : null);
         // document.location = document.baseURI + window.location.search;
       } catch (err) {
         if (err.response.status === 401) {

@@ -59,13 +59,12 @@ func tryFindLDAPUser(username, password string) (*db.User, error) {
 
 // createSession creates session for passed user and stores session details
 // in cookies.
-func createSession(w http.ResponseWriter, r *http.Request, user db.User, oidc bool) {
-	var err error
+func createSession(w http.ResponseWriter, r *http.Request, user db.User, oidc bool) (*db.Session, error) {
 	var verificationMethod db.SessionVerificationMethod
 	verified := false
 
 	switch {
-	case user.Totp != nil && util.GetTotpConfig().Enabled:
+	case util.GetTotpConfig().Enabled:
 		verificationMethod = db.SessionVerificationTotp
 	default:
 		verificationMethod = db.SessionVerificationNone
@@ -89,7 +88,7 @@ func createSession(w http.ResponseWriter, r *http.Request, user db.User, oidc bo
 			"context": "session",
 		}).Error("Failed to create session")
 		helpers.WriteErrorStatus(w, "Failed to create session", http.StatusInternalServerError)
-		return
+		return nil, err
 	}
 
 	encoded, err := util.Cookie.Encode("semaphore", map[string]any{
@@ -102,7 +101,7 @@ func createSession(w http.ResponseWriter, r *http.Request, user db.User, oidc bo
 			"context": "session",
 		}).Error("Failed to encode session cookie")
 		helpers.WriteErrorStatus(w, "Failed to create session", http.StatusInternalServerError)
-		return
+		return nil, err
 	}
 
 	http.SetCookie(w, &http.Cookie{
@@ -111,6 +110,8 @@ func createSession(w http.ResponseWriter, r *http.Request, user db.User, oidc bo
 		Path:     "/",
 		HttpOnly: true,
 	})
+
+	return &newSession, nil
 }
 
 func loginByPassword(store db.Store, login string, password string) (user db.User, err error) {
@@ -250,11 +251,12 @@ func login(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var user db.User
+	store := helpers.Store(r)
 
 	if ldapUser == nil {
-		user, err = loginByPassword(helpers.Store(r), login.Auth, login.Password)
+		user, err = loginByPassword(store, login.Auth, login.Password)
 	} else {
-		user, err = loginByLDAP(helpers.Store(r), *ldapUser)
+		user, err = loginByLDAP(store, *ldapUser)
 	}
 
 	if err != nil {
@@ -273,7 +275,38 @@ func login(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusInternalServerError)
 	}
 
-	createSession(w, r, user, false)
+	user, recoveryCode, totpEnrolled, err := ensureUserTotpEnrollment(store, user)
+	if err != nil {
+		log.Error(err.Error())
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+
+	session, err := createSession(w, r, user, false)
+	if err != nil {
+		return
+	}
+
+	clearTotpSetupCookie(w)
+	if util.GetTotpConfig().Enabled && totpEnrolled {
+		if err = writeTotpSetupCookie(w, *session, recoveryCode); err != nil {
+			log.Error(err.Error())
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+
+		setup, err := buildTotpSetupResponse(user, recoveryCode)
+		if err != nil {
+			log.Error(err.Error())
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+
+		helpers.WriteJSON(w, http.StatusOK, map[string]any{
+			"totp_setup": setup,
+		})
+		return
+	}
 
 	w.WriteHeader(http.StatusNoContent)
 }
@@ -306,6 +339,8 @@ func logout(w http.ResponseWriter, r *http.Request) {
 		Path:     "/",
 		HttpOnly: true,
 	})
+
+	clearTotpSetupCookie(w)
 
 	w.WriteHeader(http.StatusNoContent)
 }
@@ -543,6 +578,58 @@ func parseClaims(claims map[string]any, provider util.ClaimsProvider) (res claim
 	return
 }
 
+func getLDAPFallbackUsername(requestedLogin string, email string) string {
+	fallback := strings.TrimSpace(strings.ToLower(requestedLogin))
+
+	if strings.Contains(fallback, `\`) {
+		parts := strings.Split(fallback, `\`)
+		fallback = parts[len(parts)-1]
+	}
+
+	if strings.Contains(fallback, "@") {
+		parts := strings.SplitN(fallback, "@", 2)
+		fallback = parts[0]
+	}
+
+	if fallback != "" {
+		return fallback
+	}
+
+	fallback = strings.TrimSpace(strings.ToLower(email))
+	if strings.Contains(fallback, "@") {
+		parts := strings.SplitN(fallback, "@", 2)
+		fallback = parts[0]
+	}
+
+	if fallback != "" {
+		return fallback
+	}
+
+	return getRandomUsername()
+}
+
+func parseLDAPClaims(claims map[string]any, provider util.ClaimsProvider, requestedLogin string) (res claimResult, err error) {
+	var ok bool
+
+	res.email, ok = parseClaim(provider.GetEmailClaim(), claims)
+	if !ok {
+		err = fmt.Errorf("claim '%s' missing or has bad format", provider.GetEmailClaim())
+		return
+	}
+
+	res.username, ok = parseClaim(provider.GetUsernameClaim(), claims)
+	if !ok {
+		res.username = getLDAPFallbackUsername(requestedLogin, res.email)
+	}
+
+	res.name, ok = parseClaim(provider.GetNameClaim(), claims)
+	if !ok {
+		res.name = getRandomProfileName()
+	}
+
+	return
+}
+
 func claimOidcUserInfo(userInfo *oidc.UserInfo, provider util.OidcProvider) (res claimResult, err error) {
 	claims := make(map[string]any)
 	if err = userInfo.Claims(&claims); err != nil {
@@ -703,7 +790,26 @@ func oidcRedirect(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	createSession(w, r, user, true)
+	user, recoveryCode, totpEnrolled, err := ensureUserTotpEnrollment(helpers.Store(r), user)
+	if err != nil {
+		log.Error(err.Error())
+		http.Redirect(w, r, loginURL, http.StatusTemporaryRedirect)
+		return
+	}
+
+	session, err := createSession(w, r, user, true)
+	if err != nil {
+		return
+	}
+
+	clearTotpSetupCookie(w)
+	if util.GetTotpConfig().Enabled && totpEnrolled {
+		if err = writeTotpSetupCookie(w, *session, recoveryCode); err != nil {
+			log.Error(err.Error())
+			http.Redirect(w, r, loginURL, http.StatusTemporaryRedirect)
+			return
+		}
+	}
 
 	config, ok := util.Config.OidcProviders[pid]
 	if !ok {
