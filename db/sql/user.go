@@ -89,24 +89,26 @@ func (d *SqlDb) UpdateUser(user db.UserWithPwd) error {
 			return err
 		}
 		_, err = d.exec(
-			"update `user` set name=?, username=?, email=?, alert=?, admin=?, pro=?, password=? where id=?",
+			"update `user` set name=?, username=?, email=?, alert=?, admin=?, pro=?, external=?, password=? where id=?",
 			user.Name,
 			user.Username,
 			user.Email,
 			user.Alert,
 			user.Admin,
 			user.Pro,
+			user.External,
 			string(pwdHash),
 			user.ID)
 	} else {
 		_, err = d.exec(
-			"update `user` set name=?, username=?, email=?, alert=?, admin=?, pro=? where id=?",
+			"update `user` set name=?, username=?, email=?, alert=?, admin=?, pro=?, external=? where id=?",
 			user.Name,
 			user.Username,
 			user.Email,
 			user.Alert,
 			user.Admin,
 			user.Pro,
+			user.External,
 			user.ID)
 	}
 

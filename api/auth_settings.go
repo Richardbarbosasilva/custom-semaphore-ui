@@ -289,20 +289,197 @@ func bindLDAPReader(conn *ldap.Conn, cfg ldapRuntimeConfig) error {
 	return conn.Bind(cfg.BindDN, cfg.BindPassword)
 }
 
-func searchLDAPUser(conn *ldap.Conn, cfg ldapRuntimeConfig, username string, attrs []string) (*ldap.SearchResult, error) {
-	filter := fmt.Sprintf(cfg.SearchFilter, ldap.EscapeFilter(strings.TrimSpace(username)))
+func appendLDAPCandidate(candidates []string, value string) []string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return candidates
+	}
 
-	return conn.Search(ldap.NewSearchRequest(
-		cfg.SearchDN,
-		ldap.ScopeWholeSubtree,
-		ldap.NeverDerefAliases,
-		0,
-		0,
-		false,
-		filter,
-		attrs,
-		nil,
-	))
+	for _, candidate := range candidates {
+		if strings.EqualFold(candidate, value) {
+			return candidates
+		}
+	}
+
+	return append(candidates, value)
+}
+
+func getLDAPSearchCandidates(username string) []string {
+	username = strings.TrimSpace(username)
+
+	candidates := []string{}
+	candidates = appendLDAPCandidate(candidates, username)
+
+	if strings.Contains(username, `\`) {
+		parts := strings.Split(username, `\`)
+		candidates = appendLDAPCandidate(candidates, parts[len(parts)-1])
+	}
+
+	if strings.Contains(username, "@") {
+		parts := strings.SplitN(username, "@", 2)
+		candidates = appendLDAPCandidate(candidates, parts[0])
+	}
+
+	return candidates
+}
+
+func getLDAPDomainFromSearchDN(searchDN string) string {
+	domainParts := make([]string, 0)
+
+	for _, part := range strings.Split(searchDN, ",") {
+		part = strings.TrimSpace(part)
+		if len(part) < 4 || !strings.EqualFold(part[:3], "dc=") {
+			continue
+		}
+
+		domainParts = append(domainParts, part[3:])
+	}
+
+	return strings.Join(domainParts, ".")
+}
+
+func getLDAPNetBIOSDomainFromSearchDN(searchDN string) string {
+	for _, part := range strings.Split(searchDN, ",") {
+		part = strings.TrimSpace(part)
+		if len(part) < 4 || !strings.EqualFold(part[:3], "dc=") {
+			continue
+		}
+
+		return strings.ToUpper(part[3:])
+	}
+
+	return ""
+}
+
+func getLDAPBindCandidates(cfg ldapRuntimeConfig, username string) []string {
+	username = strings.TrimSpace(username)
+
+	candidates := []string{}
+	candidates = appendLDAPCandidate(candidates, username)
+
+	for _, candidate := range getLDAPSearchCandidates(username) {
+		candidates = appendLDAPCandidate(candidates, candidate)
+	}
+
+	if !strings.Contains(username, "@") && !strings.Contains(username, `\`) {
+		if domain := getLDAPDomainFromSearchDN(cfg.SearchDN); domain != "" {
+			candidates = appendLDAPCandidate(candidates, fmt.Sprintf("%s@%s", username, domain))
+		}
+
+		if netbios := getLDAPNetBIOSDomainFromSearchDN(cfg.SearchDN); netbios != "" {
+			candidates = appendLDAPCandidate(candidates, fmt.Sprintf(`%s\%s`, netbios, username))
+		}
+	}
+
+	return candidates
+}
+
+func searchLDAPUser(conn *ldap.Conn, cfg ldapRuntimeConfig, username string, attrs []string) (*ldap.Entry, error) {
+	var lastErr error
+
+	for _, candidate := range getLDAPSearchCandidates(username) {
+		filter := fmt.Sprintf(cfg.SearchFilter, ldap.EscapeFilter(candidate))
+
+		searchResult, err := conn.Search(ldap.NewSearchRequest(
+			cfg.SearchDN,
+			ldap.ScopeWholeSubtree,
+			ldap.NeverDerefAliases,
+			0,
+			0,
+			false,
+			filter,
+			attrs,
+			nil,
+		))
+		if err != nil {
+			lastErr = err
+			continue
+		}
+
+		if len(searchResult.Entries) > 1 {
+			return nil, fmt.Errorf("too many entries returned")
+		}
+
+		if len(searchResult.Entries) == 1 {
+			return searchResult.Entries[0], nil
+		}
+	}
+
+	if lastErr != nil {
+		return nil, lastErr
+	}
+
+	return nil, nil
+}
+
+func isLDAPAuthFailure(err error) bool {
+	if err == nil {
+		return false
+	}
+
+	return ldap.IsErrorWithCode(err, ldap.LDAPResultInvalidCredentials) ||
+		ldap.IsErrorWithCode(err, ldap.LDAPResultInappropriateAuthentication) ||
+		ldap.IsErrorWithCode(err, ldap.LDAPResultNoSuchObject) ||
+		ldap.IsErrorWithCode(err, ldap.LDAPResultInvalidDNSyntax)
+}
+
+func bindLDAPUserDirect(conn *ldap.Conn, cfg ldapRuntimeConfig, username string, password string) error {
+	var lastErr error
+
+	for _, candidate := range getLDAPBindCandidates(cfg, username) {
+		if err := conn.Bind(candidate, password); err != nil {
+			lastErr = err
+			if isLDAPAuthFailure(err) {
+				continue
+			}
+
+			continue
+		}
+
+		return nil
+	}
+
+	return lastErr
+}
+
+func fetchLDAPUser(conn *ldap.Conn, cfg ldapRuntimeConfig, username string) (*db.User, error) {
+	entry, err := searchLDAPUser(conn, cfg, username, []string{
+		cfg.Mappings.DN,
+		cfg.Mappings.Mail,
+		cfg.Mappings.UID,
+		cfg.Mappings.CN,
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	if entry == nil {
+		return nil, nil
+	}
+
+	claimsMap := convertEntryToMap(entry)
+
+	prepareClaims(claimsMap)
+
+	claims, err := parseLDAPClaims(claimsMap, &cfg.Mappings, username)
+	if err != nil {
+		return nil, err
+	}
+
+	ldapUser := db.User{
+		Username: strings.ToLower(claims.username),
+		Created:  tz.Now(),
+		Name:     claims.name,
+		Email:    claims.email,
+		External: true,
+		Alert:    false,
+	}
+
+	if err = db.ValidateUser(ldapUser); err != nil {
+		return nil, err
+	}
+
+	return &ldapUser, nil
 }
 
 func findLDAPUserWithConfig(cfg ldapRuntimeConfig, username string, password string) (*db.User, error) {
@@ -322,70 +499,56 @@ func findLDAPUserWithConfig(cfg ldapRuntimeConfig, username string, password str
 	}
 	defer conn.Close() //nolint:errcheck
 
-	if err = bindLDAPReader(conn, cfg); err != nil {
+	readerBindErr := bindLDAPReader(conn, cfg)
+	if readerBindErr == nil {
+		userEntry, err := searchLDAPUser(conn, cfg, username, []string{cfg.Mappings.DN})
+		if err != nil {
+			return nil, err
+		}
+
+		if userEntry != nil {
+			if err = conn.Bind(userEntry.DN, password); err != nil {
+				if isLDAPAuthFailure(err) {
+					return nil, nil
+				}
+
+				return nil, err
+			}
+
+			// Prefer the reader bind for the profile lookup when it works, but keep
+			// the successful user bind if the service account is unavailable.
+			if err = bindLDAPReader(conn, cfg); err != nil {
+				if !isLDAPAuthFailure(err) {
+					return nil, err
+				}
+			}
+
+			return fetchLDAPUser(conn, cfg, username)
+		}
+	}
+
+	if err = bindLDAPUserDirect(conn, cfg, username, password); err != nil {
+		if isLDAPAuthFailure(err) {
+			return nil, nil
+		}
+
+		if readerBindErr != nil {
+			return nil, readerBindErr
+		}
+
 		return nil, err
 	}
 
-	searchResult, err := searchLDAPUser(conn, cfg, username, []string{cfg.Mappings.DN})
+	ldapUser, err := fetchLDAPUser(conn, cfg, username)
 	if err != nil {
 		return nil, err
 	}
 
-	if len(searchResult.Entries) < 1 {
-		return nil, nil
+	if ldapUser != nil {
+		return ldapUser, nil
 	}
 
-	if len(searchResult.Entries) > 1 {
-		return nil, fmt.Errorf("too many entries returned")
-	}
-
-	userDN := searchResult.Entries[0].DN
-	if err = conn.Bind(userDN, password); err != nil {
-		return nil, err
-	}
-
-	if err = bindLDAPReader(conn, cfg); err != nil {
-		return nil, err
-	}
-
-	searchResult, err = searchLDAPUser(conn, cfg, username, []string{
-		cfg.Mappings.DN,
-		cfg.Mappings.Mail,
-		cfg.Mappings.UID,
-		cfg.Mappings.CN,
-	})
-	if err != nil {
-		return nil, err
-	}
-
-	if len(searchResult.Entries) <= 0 {
-		return nil, fmt.Errorf("ldap search returned no entries")
-	}
-
-	entry := convertEntryToMap(searchResult.Entries[0])
-
-	prepareClaims(entry)
-
-	claims, err := parseLDAPClaims(entry, &cfg.Mappings, username)
-	if err != nil {
-		return nil, err
-	}
-
-	ldapUser := db.User{
-		Username: strings.ToLower(claims.username),
-		Created:  tz.Now(),
-		Name:     claims.name,
-		Email:    claims.email,
-		External: true,
-		Alert:    false,
-	}
-
-	err = db.ValidateUser(ldapUser)
-	if err != nil {
-		return nil, err
-	}
-
-	return &ldapUser, nil
+	return nil, fmt.Errorf("ldap bind succeeded but user profile lookup returned no entries")
 }
 
 func testLDAPReaderConnection(cfg ldapRuntimeConfig) error {

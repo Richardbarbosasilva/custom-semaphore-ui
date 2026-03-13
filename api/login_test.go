@@ -8,8 +8,11 @@ import (
 	"testing"
 	"time"
 
+	"github.com/semaphoreui/semaphore/db"
+	boltstore "github.com/semaphoreui/semaphore/db/bolt"
 	"github.com/semaphoreui/semaphore/util"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestParseClaim(t *testing.T) {
@@ -213,4 +216,92 @@ func TestNormalizeLDAPConfigUsesActiveDirectoryMappings(t *testing.T) {
 	assert.Equal(t, defaultADCNMapping, cfg.Mappings.CN)
 	assert.Equal(t, defaultADDNMapping, cfg.Mappings.DN)
 	assert.Equal(t, defaultADMailMapping, cfg.Mappings.Mail)
+}
+
+func TestGetLDAPSearchCandidates(t *testing.T) {
+	assert.Equal(t, []string{"richard.silva"}, getLDAPSearchCandidates("richard.silva"))
+	assert.Equal(t, []string{"richard.silva@clickip.local", "richard.silva"}, getLDAPSearchCandidates("richard.silva@clickip.local"))
+	assert.Equal(t, []string{`CLICKIP\richard.silva`, "richard.silva"}, getLDAPSearchCandidates(`CLICKIP\richard.silva`))
+}
+
+func TestGetLDAPBindCandidates(t *testing.T) {
+	cfg := ldapRuntimeConfig{
+		SearchDN: "DC=clickip,DC=local",
+	}
+
+	assert.Equal(t, []string{
+		"richard.silva",
+		"richard.silva@clickip.local",
+		`CLICKIP\richard.silva`,
+	}, getLDAPBindCandidates(cfg, "richard.silva"))
+
+	assert.Equal(t, []string{
+		"richard.silva@clickip.local",
+		"richard.silva",
+	}, getLDAPBindCandidates(cfg, "richard.silva@clickip.local"))
+}
+
+func TestLoginByLDAPCreatesExternalUserWhenMissing(t *testing.T) {
+	store := boltstore.CreateTestStore()
+
+	ldapUser := db.User{
+		Username: "richard.silva",
+		Name:     "Richard Barbosa Silva",
+		Email:    "richard.silva@clickip.com.br",
+		External: true,
+	}
+
+	user, err := loginByLDAP(store, ldapUser)
+	require.NoError(t, err)
+
+	assert.True(t, user.External)
+	assert.Equal(t, ldapUser.Username, user.Username)
+	assert.Equal(t, ldapUser.Email, user.Email)
+
+	found, err := store.GetUserByLoginOrEmail(ldapUser.Username, ldapUser.Email)
+	require.NoError(t, err)
+	assert.True(t, found.External)
+	assert.Equal(t, ldapUser.Name, found.Name)
+}
+
+func TestLoginByLDAPLinksExistingLocalUser(t *testing.T) {
+	store := boltstore.CreateTestStore()
+
+	localUser, err := store.CreateUser(db.UserWithPwd{
+		Pwd: "123456",
+		User: db.User{
+			Username: "richard.silva",
+			Name:     "Richard Local",
+			Email:    "old.richard@clickip.com.br",
+			Admin:    true,
+			Alert:    true,
+			Pro:      true,
+		},
+	})
+	require.NoError(t, err)
+
+	ldapUser := db.User{
+		Username: "richard.silva",
+		Name:     "Richard Barbosa Silva",
+		Email:    "richard.silva@clickip.com.br",
+		External: true,
+	}
+
+	user, err := loginByLDAP(store, ldapUser)
+	require.NoError(t, err)
+
+	assert.Equal(t, localUser.ID, user.ID)
+	assert.True(t, user.External)
+	assert.Equal(t, ldapUser.Name, user.Name)
+	assert.Equal(t, ldapUser.Email, user.Email)
+	assert.True(t, user.Admin)
+	assert.True(t, user.Alert)
+	assert.True(t, user.Pro)
+
+	found, err := store.GetUser(localUser.ID)
+	require.NoError(t, err)
+	assert.True(t, found.External)
+	assert.Equal(t, ldapUser.Email, found.Email)
+	assert.Equal(t, ldapUser.Name, found.Name)
+	assert.True(t, found.Admin)
 }

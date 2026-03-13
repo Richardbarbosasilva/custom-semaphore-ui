@@ -139,15 +139,29 @@ func loginByLDAP(store db.Store, ldapUser db.User) (user db.User, err error) {
 
 	if errors.Is(err, db.ErrNotFound) {
 		user, err = store.CreateUserWithoutPassword(ldapUser)
+		return
 	}
 
 	if err != nil {
 		return
 	}
 
-	if !user.External {
-		err = db.ErrNotFound
-		return
+	// Preserve the existing account and project memberships, but bind it to LDAP
+	// once the directory authentication has already succeeded.
+	needsSync := !user.External ||
+		user.Username != ldapUser.Username ||
+		user.Email != ldapUser.Email ||
+		user.Name != ldapUser.Name
+
+	if needsSync {
+		user.Username = ldapUser.Username
+		user.Email = ldapUser.Email
+		user.Name = ldapUser.Name
+		user.External = true
+
+		if err = store.UpdateUser(db.UserWithPwd{User: user}); err != nil {
+			return
+		}
 	}
 
 	return
